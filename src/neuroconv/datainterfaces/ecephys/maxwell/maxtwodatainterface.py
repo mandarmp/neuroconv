@@ -8,69 +8,24 @@ from neuroconv.tools.spikeinterface import add_recording_to_nwbfile
 from neuroconv.utils import DeepDict
 
 
-class MaxTwoRecordingInterface(BaseDataInterface):  # pragma: no cover
-    """
-    Primary data interface class for converting all wells/streams from MaxTwo data.
-
-    Uses the :py:class:`~spikeinterface.extractors.MaxwellRecordingExtractor` from SpikeInterface.
-    This interface natively discovers all active streams in the file and extracts them together.
-    """
-
+class MaxTwoRecordingInterface(BaseDataInterface):
     display_name = "MaxTwo Recording"
     associated_suffixes = (".raw", ".h5")
-    info = "Interface for MaxTwo recording data (handles all multi-well streams simultaneously)."
-
-    @classmethod
-    def get_source_schema(cls) -> dict:
-        return {
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the MaxTwo .raw.h5 file."
-                }
-            },
-            "required": ["file_path"],
-        }
-
-    @staticmethod
-    def auto_install_maxwell_hdf5_compression_plugin(
-        hdf5_plugin_path: DirectoryPath | None = None, download_plugin: bool = True
-    ) -> None:
-        """
-        If you do not yet have the Maxwell compression plugin installed, this function will automatically install it.
-        """
-        from neo.rawio.maxwellrawio import auto_install_maxwell_hdf5_compression_plugin
-
-        auto_install_maxwell_hdf5_compression_plugin(hdf5_plugin_path=hdf5_plugin_path, force_download=download_plugin)
 
     def __init__(
         self,
         file_path: FilePath,
         *,
+        well_metadata: dict | None = None,
         hdf5_plugin_path: DirectoryPath | None = None,
         download_plugin: bool = True,
         verbose: bool = False,
-    ) -> None:
-        """
-        Load and prepare data for all active wells from a MaxTwo file.
-
-        Parameters
-        ----------
-        file_path : string or Path
-            Path to the .raw.h5 file.
-        hdf5_plugin_path : string or Path, optional
-            Path to your systems HDF5 plugin library.
-            Uses the home directory by default.
-        download_plugin : boolean, default: True
-            Whether to force download of the decompression plugin.
-        verbose : boolean, default: False
-            Allows verbosity.
-        """
-        # BaseDataInterface initialization
+    ):
         super().__init__(file_path=file_path, verbose=verbose)
         self.file_path = file_path
+        self.verbose = verbose
 
-        # Install decompression plugin
+        # Set HDF5 plugin path
         hdf5_plugin_path = os.environ.get(
             "HDF5_PLUGIN_PATH",
             hdf5_plugin_path or Path.home() / "hdf5_plugin_path_maxwell",
@@ -78,71 +33,117 @@ class MaxTwoRecordingInterface(BaseDataInterface):  # pragma: no cover
         os.environ["HDF5_PLUGIN_PATH"] = str(hdf5_plugin_path)
 
         if download_plugin:
-            self.auto_install_maxwell_hdf5_compression_plugin(hdf5_plugin_path=hdf5_plugin_path)
+            from neo.rawio.maxwellrawio import auto_install_maxwell_hdf5_compression_plugin
+            auto_install_maxwell_hdf5_compression_plugin(hdf5_plugin_path=hdf5_plugin_path)
 
-        # Local import to prevent global SpikeInterface loading
+        # Load streams
         from spikeinterface.extractors.extractor_classes import MaxwellRecordingExtractor
 
-        # Discover all streams (wells) in the dataset
-        stream_names, stream_ids = MaxwellRecordingExtractor.get_streams(file_path=self.file_path)
+        _, stream_ids = MaxwellRecordingExtractor.get_streams(file_path=self.file_path)
 
-        # Initialize a dictionary to hold an extractor for every stream
-        self.recording_extractors = {}
-        for stream_id in stream_ids:
-            self.recording_extractors[stream_id] = MaxwellRecordingExtractor(
-                file_path=self.file_path, stream_id=stream_id
-            )
+        self.recording_extractors = {
+            sid: MaxwellRecordingExtractor(file_path=self.file_path, stream_id=sid)
+            for sid in stream_ids
+        }
 
-    def get_metadata(self) -> DeepDict:
+        # Per-well metadata
+        self.well_metadata = well_metadata or {}
+
+    # ---------------------------------------------------------------------
+    # Per-stream metadata
+    # ---------------------------------------------------------------------
+    def get_metadata_for_stream(self, stream_id) -> DeepDict:
         metadata = super().get_metadata()
+        metadata.setdefault("Ecephys", {})
 
-        metadata.setdefault("Ecephys", dict())
-        metadata["Ecephys"].setdefault("Device", [])
-        
-        # Pull Maxwell version from the first available stream
+        wm = self.well_metadata.get(stream_id, {})
+
+        genotype = wm.get("genotype", "UNKNOWN")
+        sex = wm.get("sex", "U")
+        div = wm.get("DIV", "NA")
+        treatment = wm.get("treatment", "none")
+        chip_id = wm.get("chip_id", "unknown_chip")
+        run_id = wm.get("run_id", "run")
+
+        # NWBFile
+        metadata["NWBFile"].update(
+            session_description=f"HD-MEA recording well {stream_id}",
+            identifier=f"{chip_id}_{run_id}_{stream_id}",
+            experiment_description=f"Primary cortical neurons | DIV{div} | {treatment}",
+        )
+
+        # Subject
+        metadata["Subject"] = dict(
+            subject_id=f"{chip_id}_{stream_id}",
+            species="Mus musculus",
+            genotype=genotype,
+            sex=sex,
+            description=f"Primary cortical culture (well {stream_id})",
+        )
+
+        # Device
         first_extractor = list(self.recording_extractors.values())[0]
         maxwell_version = first_extractor.neo_reader.raw_annotations["blocks"][0]["maxwell_version"]
 
-        metadata["Ecephys"]["Device"].append(
-            dict(
-                name="MaxTwo",
-                description=f"Maxwell Biosystems MaxTwo HD-MEA. Recorded using Maxwell version '{maxwell_version}'.",
-                manufacturer="Maxwell Biosystems"
-            )
-        )
+        metadata["Ecephys"]["Device"] = [dict(
+            name="MaxTwo",
+            description=f"Maxwell HD-MEA (v{maxwell_version})",
+            manufacturer="Maxwell Biosystems",
+        )]
 
-        metadata["Ecephys"].setdefault("ElectrodeGroup", [])
-        for stream_id in self.recording_extractors.keys():
-            metadata["Ecephys"]["ElectrodeGroup"].append(
-                dict(
-                    name=f"ElectrodeGroup_{stream_id}",
-                    description=f"HD-MEA for stream {stream_id}",
-                    location="primary neuron culture",
-                    device="MaxTwo"
-                )
-            )
+        # ElectrodeGroup (one per well)
+        metadata["Ecephys"]["ElectrodeGroup"] = [dict(
+            name=f"ElectrodeGroup_{stream_id}",
+            description=f"Well {stream_id} | genotype={genotype} | DIV={div}",
+            location="primary cortical culture",
+            device="MaxTwo",
+        )]
+
+        # ElectricalSeries (required by NeuroConv)
+        metadata["Ecephys"]["ElectricalSeries"] = dict(
+            name="ElectricalSeries",
+            description=f"Raw extracellular recording | well {stream_id}",
+        )
 
         return metadata
 
-    def add_to_nwbfile(self, nwbfile, metadata: dict | None = None, **kwargs):
-        """
-        Iterate over all SpikeInterface extractors and add them as separate ElectricalSeries to the NWBFile.
-        """
-        if metadata is None:
-            metadata = self.get_metadata()
+    # ---------------------------------------------------------------------
+    # Write a single stream
+    # ---------------------------------------------------------------------
+    def add_to_nwbfile(self, nwbfile, metadata=None, stream_id=None, **kwargs):
+        if stream_id is None:
+            raise ValueError("stream_id must be provided")
 
-        for stream_id, recording_extractor in self.recording_extractors.items():
-            if self.verbose:
-                print(f"Writing stream {stream_id} to NWB...")
+        recording = self.recording_extractors[stream_id]
 
-            # Pass the individual recording extractor to the NeuroConv writing tool
-            add_recording_to_nwbfile(
-                recording=recording_extractor,
-                nwbfile=nwbfile,
+        add_recording_to_nwbfile(
+            recording=recording,
+            nwbfile=nwbfile,
+            metadata=metadata,
+            es_key="ElectricalSeries",
+            write_as="raw",
+            iterator_type="v2",
+            **kwargs
+        )
+
+    # ---------------------------------------------------------------------
+    # Driver: convert each stream to its own NWB file
+    # ---------------------------------------------------------------------
+    def run_conversion_per_stream(self, output_dir):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
+
+        for stream_id in self.recording_extractors.keys():
+            print(f"Converting {stream_id}")
+
+            metadata = self.get_metadata_for_stream(stream_id)
+            out_path = output_dir / f"{stream_id}.nwb"
+
+            self.run_conversion(
+                nwbfile_path=str(out_path),
                 metadata=metadata,
-                es_key=f"ElectricalSeries_{stream_id}",
-                write_as="raw",
-                iterator_type="v2",
-                write_electrical_series=True,
-                **kwargs
+                overwrite=True,
+                conversion_options=dict(
+                    add_to_nwbfile=dict(stream_id=stream_id)
+                ),
             )
